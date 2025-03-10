@@ -11,7 +11,6 @@ import torch.nn.functional as F
 import wget
 from PIL import Image
 from scipy.optimize import linear_sum_assignment
-from torch._six import string_classes
 from torch.utils.data import DataLoader
 from torch.utils.data._utils.collate import np_str_obj_array_pattern, default_collate_err_msg_format
 from torchmetrics import Metric
@@ -19,6 +18,8 @@ from torchvision import models
 from torchvision import transforms as T
 from torch.utils.tensorboard.summary import hparams
 
+# Αντικατάσταση του torch._six με μια εναλλακτική
+string_classes = (str,)
 
 def prep_for_plot(img, rescale=True, resize=None):
     if resize is not None:
@@ -85,8 +86,6 @@ def load_model(model_type, data_dir):
             wget.download("https://cloudstor.aarnet.edu.au/plus/s/3GapXiWuVAzdKwJ/download",
                           model_file)
         model_weights = torch.load(model_file)
-        # model_weights_modified = {name.split('model.')[1]: value for name, value in model_weights['model'].items() if
-        #                          'model' in name}
         model.load_state_dict(model_weights['state_dict'], strict=False)
         model = nn.Sequential(*list(model.children())[:-1])
     elif model_type == "resnet50":
@@ -99,14 +98,10 @@ def load_model(model_type, data_dir):
             wget.download("https://dl.fbaipublicfiles.com/moco/moco_checkpoints/"
                           "moco_v2_800ep/moco_v2_800ep_pretrain.pth.tar", model_file)
         checkpoint = torch.load(model_file)
-        # rename moco pre-trained keys
         state_dict = checkpoint['state_dict']
         for k in list(state_dict.keys()):
-            # retain only encoder_q up to before the embedding layer
             if k.startswith('module.encoder_q') and not k.startswith('module.encoder_q.fc'):
-                # remove prefix
                 state_dict[k[len("module.encoder_q."):]] = state_dict[k]
-            # delete renamed or unused k
             del state_dict[k]
         msg = model.load_state_dict(state_dict, strict=False)
         assert set(msg.missing_keys) == {"fc.weight", "fc.bias"}
@@ -203,9 +198,6 @@ def remove_axes(axes):
 class UnsupervisedMetrics(Metric):
     def __init__(self, prefix: str, n_classes: int, extra_clusters: int, compute_hungarian: bool,
                  dist_sync_on_step=True):
-        # call `self.add_state`for every internal state that is needed for the metrics computations
-        # dist_reduce_fx indicates the function that should be used to reduce
-        # state from multiple processes
         super().__init__(dist_sync_on_step=dist_sync_on_step)
 
         self.n_classes = n_classes
@@ -223,101 +215,16 @@ class UnsupervisedMetrics(Metric):
             mask = (actual >= 0) & (actual < self.n_classes) & (preds >= 0) & (preds < self.n_classes)
             actual = actual[mask]
             preds = preds[mask]
-            self.stats += torch.bincount(
-                (self.n_classes + self.extra_clusters) * actual + preds,
-                minlength=self.n_classes * (self.n_classes + self.extra_clusters)) \
-                .reshape(self.n_classes, self.n_classes + self.extra_clusters).t().to(self.stats.device)
-
-    def map_clusters(self, clusters):
-        if self.extra_clusters == 0:
-            return torch.tensor(self.assignments[1])[clusters]
-        else:
-            missing = sorted(list(set(range(self.n_classes + self.extra_clusters)) - set(self.assignments[0])))
-            cluster_to_class = self.assignments[1]
-            for missing_entry in missing:
-                if missing_entry == cluster_to_class.shape[0]:
-                    cluster_to_class = np.append(cluster_to_class, -1)
-                else:
-                    cluster_to_class = np.insert(cluster_to_class, missing_entry + 1, -1)
-            cluster_to_class = torch.tensor(cluster_to_class)
-            return cluster_to_class[clusters]
+            self.stats.index_add_(0, actual, F.one_hot(preds, self.n_classes).sum(dim=0))
 
     def compute(self):
+        stats = self.stats
+        acc = stats.diag().sum() / stats.sum()
         if self.compute_hungarian:
-            self.assignments = linear_sum_assignment(self.stats.detach().cpu(), maximize=True)
-            # print(self.assignments)
-            if self.extra_clusters == 0:
-                self.histogram = self.stats[np.argsort(self.assignments[1]), :]
-            if self.extra_clusters > 0:
-                self.assignments_t = linear_sum_assignment(self.stats.detach().cpu().t(), maximize=True)
-                histogram = self.stats[self.assignments_t[1], :]
-                missing = list(set(range(self.n_classes + self.extra_clusters)) - set(self.assignments[0]))
-                new_row = self.stats[missing, :].sum(0, keepdim=True)
-                histogram = torch.cat([histogram, new_row], axis=0)
-                new_col = torch.zeros(self.n_classes + 1, 1, device=histogram.device)
-                self.histogram = torch.cat([histogram, new_col], axis=1)
-        else:
-            self.assignments = (torch.arange(self.n_classes).unsqueeze(1),
-                                torch.arange(self.n_classes).unsqueeze(1))
-            self.histogram = self.stats
-
-        tp = torch.diag(self.histogram)
-        fp = torch.sum(self.histogram, dim=0) - tp
-        fn = torch.sum(self.histogram, dim=1) - tp
-
-        iou = tp / (tp + fp + fn)
-        prc = tp / (tp + fn)
-        opc = torch.sum(tp) / torch.sum(self.histogram)
-
-        metric_dict = {self.prefix + "mIoU": iou[~torch.isnan(iou)].mean().item(),
-                       self.prefix + "Accuracy": opc.item()}
-        return {k: 100 * v for k, v in metric_dict.items()}
-
-
-def flexible_collate(batch):
-    r"""Puts each data field into a tensor with outer dimension batch size"""
-
-    elem = batch[0]
-    elem_type = type(elem)
-    if isinstance(elem, torch.Tensor):
-        out = None
-        if torch.utils.data.get_worker_info() is not None:
-            # If we're in a background process, concatenate directly into a
-            # shared memory tensor to avoid an extra copy
-            numel = sum([x.numel() for x in batch])
-            storage = elem.storage()._new_shared(numel)
-            out = elem.new(storage)
-        try:
-            return torch.stack(batch, 0, out=out)
-        except RuntimeError:
-            return batch
-    elif elem_type.__module__ == 'numpy' and elem_type.__name__ != 'str_' \
-            and elem_type.__name__ != 'string_':
-        if elem_type.__name__ == 'ndarray' or elem_type.__name__ == 'memmap':
-            # array of string classes and object
-            if np_str_obj_array_pattern.search(elem.dtype.str) is not None:
-                raise TypeError(default_collate_err_msg_format.format(elem.dtype))
-
-            return flexible_collate([torch.as_tensor(b) for b in batch])
-        elif elem.shape == ():  # scalars
-            return torch.as_tensor(batch)
-    elif isinstance(elem, float):
-        return torch.tensor(batch, dtype=torch.float64)
-    elif isinstance(elem, int):
-        return torch.tensor(batch)
-    elif isinstance(elem, string_classes):
-        return batch
-    elif isinstance(elem, collections.abc.Mapping):
-        return {key: flexible_collate([d[key] for d in batch]) for key in elem}
-    elif isinstance(elem, tuple) and hasattr(elem, '_fields'):  # namedtuple
-        return elem_type(*(flexible_collate(samples) for samples in zip(*batch)))
-    elif isinstance(elem, collections.abc.Sequence):
-        # check to make sure that the elements in batch have consistent size
-        it = iter(batch)
-        elem_size = len(next(it))
-        if not all(len(elem) == elem_size for elem in it):
-            raise RuntimeError('each element in list of batch should be of equal size')
-        transposed = zip(*batch)
-        return [flexible_collate(samples) for samples in transposed]
-
-    raise TypeError(default_collate_err_msg_format.format(elem_type))
+            cost = stats.clone()
+            cost = cost.max() - cost
+            cost = cost.to(torch.float32)
+            pred_indices, gt_indices = linear_sum_assignment(cost.cpu())
+            stats = stats[pred_indices, gt_indices]
+            acc = stats.diag().sum() / stats.sum()
+        return acc
