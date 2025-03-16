@@ -1,6 +1,6 @@
 from os.path import join, exists
-import wget
 import os
+import requests
 
 models_dir = join("..", "models")
 os.makedirs(models_dir, exist_ok=True)
@@ -26,6 +26,14 @@ target_urls = [model_url_root + mn for mn in model_names] + \
 for target_file, target_url in zip(target_files, target_urls):
     if not exists(target_file):
         print("\nDownloading file from {}".format(target_url))
-        wget.download(target_url, target_file)
+        
+        # Replace wget.download with requests
+        response = requests.get(target_url)
+        if response.status_code == 200:
+            with open(target_file, 'wb') as f:
+                f.write(response.content)
+            print(f"File saved to {target_file}")
+        else:
+            print(f"Failed to download {target_url}, status code: {response.status_code}")
     else:
         print("\nFound {}, skipping download".format(target_file))
